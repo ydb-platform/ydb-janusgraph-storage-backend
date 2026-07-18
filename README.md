@@ -138,6 +138,53 @@ its whole lifetime. See `YdbReadModeSemanticsTest` for both semantics.
   auto-committed batches — the fastest ingestion path (not atomic, not
   rollbackable, as usual for batch loading).
 
+## Vector search (mixed indexes)
+
+The module ships a mixed-index backend (`IndexProvider`) that keeps index
+documents — including **vector embeddings** — in the same YDB database:
+
+```properties
+index.vec.backend=org.janusgraph.diskstorage.ydb.index.YdbIndexProvider
+index.vec.ydb.endpoint=grpc://localhost:2136
+index.vec.ydb.database=/local
+```
+
+```java
+// schema: float[] is a built-in JanusGraph property type
+PropertyKey embedding = mgmt.makePropertyKey("embedding").dataType(float[].class).make();
+mgmt.buildIndex("memoryVectors", Vertex.class)
+    .addKey(embedding, Parameter.of(ParameterType.customParameterName("dimension"), 1536))
+    .addKey(mgmt.makePropertyKey("kind").dataType(String.class).make(), Mapping.STRING.asParameter())
+    .buildMixedIndex("vec");
+
+// write: the index follows graph commits automatically (updates and deletions too)
+graph.addVertex("kind", "fact", "embedding", vector);
+
+// kNN: nearest neighbours with scores, no Gremlin required
+graph.indexQuery("memoryVectors", YdbVectors.nearest("embedding", queryVector))
+     .limit(20).vertexStream();
+```
+
+Capabilities and behavior:
+
+* Scalar fields (string/number/date/boolean/UUID) support exact and range
+  predicates (`Cmp`), so `has()` lookups route through the mixed index.
+* kNN runs as an **exact scan** (always correct, O(n)) until
+  `YdbIndexProvider#buildVectorIndex(store, field)` builds a
+  `vector_kmeans_tree` index — built online under a temporary name and swapped
+  in atomically; after that queries use ANN through the index. The index is
+  mutable (inserts/updates/deletes are immediately visible), but YDB never
+  recalculates centroids — rebuild periodically as the data drifts.
+* Distance strategies: `cosine` (default), `euclidean`, `manhattan`,
+  `inner_product` — via `index.[X].ydb.vector-distance` or the per-key custom
+  parameter `distance`. Scores returned to JanusGraph are "higher is closer".
+* `REINDEX` (`mgmt.updateIndex(...)`) is supported and rebuilds documents
+  through the provider's restore path.
+* Not supported: full-text and geo predicates (YDB has neither), LIST/SET
+  cardinality. The standard `IndexProviderTest` TCK hard-requires full-text and
+  geo, so coverage lives in dedicated tests (`YdbIndexProviderVectorTest`,
+  `YdbMixedIndexGraphTest`).
+
 ## Limitations
 
 * `storage.backend=ydb` shorthand is impossible (see above) — use the FQCN.

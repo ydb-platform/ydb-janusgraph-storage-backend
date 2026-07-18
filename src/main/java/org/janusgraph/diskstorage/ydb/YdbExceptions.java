@@ -30,19 +30,19 @@ import tech.ydb.core.UnexpectedResultException;
  * Statuses that YDB itself considers retryable become {@link TemporaryBackendException}
  * so that JanusGraph's {@code BackendOperation} machinery can retry them.
  */
-final class YdbExceptions {
+public final class YdbExceptions {
 
     private YdbExceptions() {
     }
 
-    static BackendException fromStatus(Status status, String operation) {
+    public static BackendException fromStatus(Status status, String operation) {
         String message = "YDB " + operation + " failed: " + status;
         return isTemporary(status.getCode())
             ? new TemporaryBackendException(message)
             : new PermanentBackendException(message);
     }
 
-    static BackendException fromThrowable(Throwable t, String operation) {
+    public static BackendException fromThrowable(Throwable t, String operation) {
         Throwable cause = t;
         while ((cause instanceof CompletionException || cause instanceof ExecutionException)
                 && cause.getCause() != null) {

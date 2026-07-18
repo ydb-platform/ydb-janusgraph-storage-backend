@@ -1,0 +1,22 @@
+{
+    "name": "janusgraph-ydb",
+    "dockerComposeFile": "docker-compose.yml",
+    "service": "dev",
+    "workspaceFolder": "/workspace",
+    "overrideCommand": true,
+    "remoteUser": "root",
+    "features": {
+        "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "vscjava.vscode-java-pack"
+            ],
+            "settings": {
+                "java.configuration.updateBuildConfiguration": "automatic"
+            }
+        }
+    },
+    "postCreateCommand": "git config --global --add safe.directory /workspace"
+}

@@ -1,0 +1,46 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    command: sleep infinity
+    working_dir: /workspace
+    volumes:
+      - ..:/workspace:cached
+      - m2-cache:/root/.m2
+    environment:
+      # Integration tests connect to the sidecar YDB by default; when these are
+      # unset, tests fall back to spinning up their own container via Testcontainers.
+      YDB_ENDPOINT: grpc://ydb:2136
+      YDB_DATABASE: /local
+      # Needed when Testcontainers is used from inside this container with the
+      # host docker socket (docker-outside-of-docker): mapped ports live on the host.
+      TESTCONTAINERS_HOST_OVERRIDE: host.docker.internal
+    depends_on:
+      ydb:
+        condition: service_healthy
+
+  ydb:
+    image: ydbplatform/local-ydb:latest
+    # local-ydb images are amd64-only; on Apple Silicon this runs via Rosetta.
+    platform: linux/amd64
+    hostname: ydb
+    environment:
+      YDB_USE_IN_MEMORY_PDISKS: "true"
+      YDB_DEFAULT_LOG_LEVEL: NOTICE
+      GRPC_PORT: "2136"
+      GRPC_TLS_PORT: "2135"
+      MON_PORT: "8765"
+    ports:
+      - "127.0.0.1:2136:2136"   # gRPC, for host-side ydb CLI poking
+      - "127.0.0.1:8765:8765"   # embedded web UI
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 6<>/dev/tcp/localhost/2136'"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+volumes:
+  m2-cache:

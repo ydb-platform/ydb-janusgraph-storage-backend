@@ -16,6 +16,7 @@ package org.janusgraph.diskstorage.ydb.index;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -23,6 +24,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import org.janusgraph.core.Cardinality;
@@ -73,8 +75,11 @@ import tech.ydb.table.description.TableIndex;
 import tech.ydb.table.query.Params;
 import tech.ydb.table.result.ResultSetReader;
 import tech.ydb.table.settings.AlterTableSettings;
+import tech.ydb.table.values.ListType;
+import tech.ydb.table.values.OptionalType;
 import tech.ydb.table.values.PrimitiveType;
 import tech.ydb.table.values.PrimitiveValue;
+import tech.ydb.table.values.StructType;
 import tech.ydb.table.values.Type;
 import tech.ydb.table.values.Value;
 
@@ -101,6 +106,11 @@ public class YdbIndexProvider implements IndexProvider {
     private static final String DOC_ID = "doc_id";
     private static final String INDEX_PREFIX = "knn_";
     private static final String TMP_INDEX_SUFFIX = "_tmp";
+
+    /** Flush a write batch once its serialized parameters approach this size (YDB caps them at 50 MB). */
+    private static final long WRITE_BATCH_BYTES = 16L * 1024 * 1024;
+    /** Whole-document deletes are id-only, so bound them by count rather than bytes. */
+    private static final int DELETE_CHUNK_ROWS = 50_000;
 
     private static final IndexFeatures FEATURES = new IndexFeatures.Builder()
         .setDefaultStringMapping(Mapping.STRING)
@@ -169,10 +179,26 @@ public class YdbIndexProvider implements IndexProvider {
     private final int indexLevels;
     private final int indexClusters;
     private final int maxResultSetSize;
+    private final long negativeCacheTtlNanos;
 
     private final Set<String> ensuredTables = ConcurrentHashMap.newKeySet();
     private final Map<String, Set<String>> knownColumns = new ConcurrentHashMap<>();
-    private final Map<String, Boolean> vectorIndexPresent = new ConcurrentHashMap<>();
+    // key = store + "/" + column; positive results are permanent (an index only disappears via
+    // clearStore/clearStorage, which invalidate it), negatives carry a timestamp and are re-probed
+    private final Map<String, IndexProbe> vectorIndexPresent = new ConcurrentHashMap<>();
+    // per-field vector distance, recorded at register() so buildVectorIndex builds with the same
+    // metric that planKnn queries with (mismatched metric is a hard INTERNAL_ERROR in YDB)
+    private final Map<String, Distance> fieldDistance = new ConcurrentHashMap<>();
+
+    private static final class IndexProbe {
+        final boolean present;
+        final long checkedAtNanos;
+
+        IndexProbe(boolean present, long checkedAtNanos) {
+            this.present = present;
+            this.checkedAtNanos = checkedAtNanos;
+        }
+    }
 
     public YdbIndexProvider(Configuration config) throws BackendException {
         String database = normalize(config.get(YdbIndexConfigOptions.DATABASE));
@@ -184,6 +210,7 @@ public class YdbIndexProvider implements IndexProvider {
         this.indexLevels = config.get(YdbIndexConfigOptions.VECTOR_INDEX_LEVELS);
         this.indexClusters = config.get(YdbIndexConfigOptions.VECTOR_INDEX_CLUSTERS);
         this.maxResultSetSize = config.get(GraphDatabaseConfiguration.INDEX_MAX_RESULT_SET_SIZE);
+        this.negativeCacheTtlNanos = config.get(YdbIndexConfigOptions.VECTOR_INDEX_RECHECK_MS) * 1_000_000L;
 
         String endpoint = config.get(YdbIndexConfigOptions.ENDPOINT);
         GrpcTransport newTransport;
@@ -236,6 +263,11 @@ public class YdbIndexProvider implements IndexProvider {
         yqlType(dataType); // throws IllegalArgumentException for unsupported types
         ensureTable(store);
         ensureColumn(store, columnName(key), yqlType(dataType));
+        if (dataType == float[].class) {
+            // remember the per-key distance so buildVectorIndex builds with the same metric
+            // planKnn later queries with (a mismatch is a hard INTERNAL_ERROR in YDB)
+            fieldDistance.put(store + "/" + columnName(key), distanceOf(information));
+        }
     }
 
     @Override
@@ -245,39 +277,27 @@ public class YdbIndexProvider implements IndexProvider {
             String store = storeEntry.getKey();
             KeyInformation.StoreRetriever infos = information.get(store);
             ensureTable(store);
-            StringBuilder statements = new StringBuilder();
-            StringBuilder declares = new StringBuilder();
-            Params params = Params.create();
-            int p = 0;
+            ColumnBatch batch = new ColumnBatch();
             for (Map.Entry<String, IndexMutation> docEntry : storeEntry.getValue().entrySet()) {
                 String docId = docEntry.getKey();
                 IndexMutation mutation = docEntry.getValue();
                 if (mutation.isDeleted()) {
-                    p = appendDelete(statements, declares, params, p, store, docId);
+                    batch.delete(docId);
                     continue;
                 }
-                Map<String, Value<?>> columns = new LinkedHashMap<>();
+                // deletions first so a same-field addition overrides the field-clear
                 if (mutation.hasDeletions()) {
                     for (IndexEntry deletion : mutation.getDeletions()) {
-                        KeyInformation info = keyInfo(infos, deletion.field);
-                        String column = ensureColumn(store, columnName(deletion.field), yqlType(info.getDataType()));
-                        columns.put(column, typeOf(info.getDataType()).makeOptional().emptyValue());
+                        batch.clearField(store, infos, docId, deletion.field);
                     }
                 }
                 if (mutation.hasAdditions()) {
                     for (IndexEntry addition : mutation.getAdditions()) {
-                        KeyInformation info = keyInfo(infos, addition.field);
-                        String column = ensureColumn(store, columnName(addition.field), yqlType(info.getDataType()));
-                        columns.put(column, toValue(info, addition.field, addition.value));
+                        batch.setField(store, infos, docId, addition.field, addition.value);
                     }
                 }
-                if (!columns.isEmpty()) {
-                    p = appendUpsert(statements, declares, params, p, store, docId, columns);
-                }
             }
-            if (statements.length() > 0) {
-                executeWrite(declares.append(statements).toString(), params);
-            }
+            writeBatch(store, batch);
         }
     }
 
@@ -288,28 +308,165 @@ public class YdbIndexProvider implements IndexProvider {
             String store = storeEntry.getKey();
             KeyInformation.StoreRetriever infos = information.get(store);
             ensureTable(store);
-            StringBuilder statements = new StringBuilder();
-            StringBuilder declares = new StringBuilder();
-            Params params = Params.create();
-            int p = 0;
+            ColumnBatch batch = new ColumnBatch();
             for (Map.Entry<String, List<IndexEntry>> docEntry : storeEntry.getValue().entrySet()) {
                 String docId = docEntry.getKey();
-                p = appendDelete(statements, declares, params, p, store, docId);
+                // restore fully replaces the document: delete the row, then re-add the new fields
+                batch.delete(docId);
                 List<IndexEntry> entries = docEntry.getValue();
                 if (entries != null && !entries.isEmpty()) {
-                    Map<String, Value<?>> columns = new LinkedHashMap<>();
                     for (IndexEntry entry : entries) {
-                        KeyInformation info = keyInfo(infos, entry.field);
-                        String column = ensureColumn(store, columnName(entry.field), yqlType(info.getDataType()));
-                        columns.put(column, toValue(info, entry.field, entry.value));
+                        batch.setField(store, infos, docId, entry.field, entry.value);
                     }
-                    p = appendUpsert(statements, declares, params, p, store, docId, columns);
                 }
             }
-            if (statements.length() > 0) {
-                executeWrite(declares.append(statements).toString(), params);
+            writeBatch(store, batch);
+        }
+    }
+
+    /**
+     * One store's pending index writes, grouped by column so the emitted query text is
+     * O(number of indexed fields), not O(number of documents): each column becomes one
+     * {@code UPSERT ... SELECT * FROM AS_TABLE($rows)} that touches only doc_id and that
+     * column, and whole-document deletes become one {@code DELETE ... WHERE doc_id IN $ids}.
+     */
+    private final class ColumnBatch {
+        final List<String> deletes = new ArrayList<>();
+        // column -> item type (the non-optional element type of the column)
+        final Map<String, Type> columnType = new LinkedHashMap<>();
+        // column -> (docId -> optional value; empty optional clears the field)
+        final Map<String, LinkedHashMap<String, Value<?>>> columnRows = new LinkedHashMap<>();
+
+        void delete(String docId) {
+            deletes.add(docId);
+        }
+
+        void clearField(String store, KeyInformation.StoreRetriever infos, String docId, String field)
+                throws BackendException {
+            KeyInformation info = keyInfo(infos, field);
+            String column = ensureColumn(store, columnName(field), yqlType(info.getDataType()));
+            Type type = typeOf(info.getDataType());
+            columnType.put(column, type);
+            rows(column).put(docId, OptionalType.of(type).emptyValue());
+        }
+
+        void setField(String store, KeyInformation.StoreRetriever infos, String docId, String field, Object value)
+                throws BackendException {
+            KeyInformation info = keyInfo(infos, field);
+            String column = ensureColumn(store, columnName(field), yqlType(info.getDataType()));
+            columnType.put(column, typeOf(info.getDataType()));
+            rows(column).put(docId, toValue(info, field, value).makeOptional());
+        }
+
+        private LinkedHashMap<String, Value<?>> rows(String column) {
+            return columnRows.computeIfAbsent(column, c -> new LinkedHashMap<>());
+        }
+
+        boolean isEmpty() {
+            return deletes.isEmpty() && columnRows.isEmpty();
+        }
+    }
+
+    private void writeBatch(String store, ColumnBatch batch) throws BackendException {
+        if (batch.isEmpty()) {
+            return;
+        }
+        String table = "`" + tablePath(store) + "`";
+        StatementBuffer buffer = new StatementBuffer();
+
+        for (int i = 0; i < batch.deletes.size(); i += DELETE_CHUNK_ROWS) {
+            List<String> part = batch.deletes.subList(i, Math.min(i + DELETE_CHUNK_ROWS, batch.deletes.size()));
+            String param = buffer.nextParam();
+            buffer.declares.append("DECLARE ").append(param).append(" AS List<Utf8>;\n");
+            buffer.statements.append("DELETE FROM ").append(table).append(" WHERE ").append(DOC_ID)
+                .append(" IN ").append(param).append(";\n");
+            buffer.params.put(param, ListType.of(PrimitiveType.Text).newValue(part.stream()
+                .map(PrimitiveValue::newText).collect(Collectors.toList())));
+            buffer.bytes += part.size() * 24L;
+            buffer.flushIfLarge();
+        }
+
+        for (Map.Entry<String, LinkedHashMap<String, Value<?>>> col : batch.columnRows.entrySet()) {
+            String column = col.getKey();
+            StructType rowType = StructType.of(DOC_ID, PrimitiveType.Text,
+                column, OptionalType.of(batch.columnType.get(column)));
+            List<Value<?>> rows = new ArrayList<>();
+            long rowBytes = 0;
+            for (Map.Entry<String, Value<?>> row : col.getValue().entrySet()) {
+                rows.add(rowType.newValue(DOC_ID, PrimitiveValue.newText(row.getKey()), column, row.getValue()));
+                rowBytes += estimateBytes(row.getValue()) + row.getKey().length() + 16L;
+                if (rowBytes >= WRITE_BATCH_BYTES) {
+                    emitUpsert(buffer, table, rowType, rows, rowBytes);
+                    rows = new ArrayList<>();
+                    rowBytes = 0;
+                }
+            }
+            if (!rows.isEmpty()) {
+                emitUpsert(buffer, table, rowType, rows, rowBytes);
             }
         }
+        buffer.flush();
+    }
+
+    private void emitUpsert(StatementBuffer buffer, String table, StructType rowType,
+                            List<Value<?>> rows, long rowBytes) throws BackendException {
+        String param = buffer.nextParam();
+        buffer.declares.append("DECLARE ").append(param).append(" AS ")
+            .append(ListType.of(rowType)).append(";\n");
+        buffer.statements.append("UPSERT INTO ").append(table)
+            .append(" SELECT * FROM AS_TABLE(").append(param).append(");\n");
+        buffer.params.put(param, ListType.of(rowType).newValue(rows));
+        buffer.bytes += rowBytes;
+        buffer.flushIfLarge();
+    }
+
+    /** Accumulates statements + params and flushes them as one query once they get large. */
+    private final class StatementBuffer {
+        StringBuilder declares = new StringBuilder();
+        StringBuilder statements = new StringBuilder();
+        Params params = Params.create();
+        long bytes = 0;
+        private int seq = 0;
+
+        String nextParam() {
+            return "$p" + seq++;
+        }
+
+        void flushIfLarge() throws BackendException {
+            if (bytes >= WRITE_BATCH_BYTES) {
+                flush();
+            }
+        }
+
+        void flush() throws BackendException {
+            if (statements.length() == 0) {
+                return;
+            }
+            executeWrite(declares.append(statements).toString(), params);
+            declares = new StringBuilder();
+            statements = new StringBuilder();
+            params = Params.create();
+            bytes = 0;
+        }
+    }
+
+    private static long estimateBytes(Value<?> value) {
+        if (value instanceof tech.ydb.table.values.OptionalValue) {
+            tech.ydb.table.values.OptionalValue opt = (tech.ydb.table.values.OptionalValue) value;
+            if (!opt.isPresent()) {
+                return 1;
+            }
+            return estimateBytes(opt.get());
+        }
+        if (value instanceof PrimitiveValue) {
+            PrimitiveValue pv = (PrimitiveValue) value;
+            try {
+                return pv.getBytesUnsafe().length;
+            } catch (RuntimeException notBytes) {
+                return 8;
+            }
+        }
+        return 8;
     }
 
     @Override
@@ -476,7 +633,8 @@ public class YdbIndexProvider implements IndexProvider {
             }
             for (tech.ydb.scheme.description.Entry child : listing.getValue().getEntryChildren()) {
                 if (child.getType() == EntryType.TABLE) {
-                    executeDdl("DROP TABLE `" + rootPath + "/" + child.getName() + "`;");
+                    // IF EXISTS so a retried drop (idempotent retry after a lost response) is a no-op
+                    executeDdl("DROP TABLE IF EXISTS `" + rootPath + "/" + child.getName() + "`;");
                 }
             }
             Status removed = schemeClient.removeDirectory(rootPath).join();
@@ -489,6 +647,7 @@ public class YdbIndexProvider implements IndexProvider {
             ensuredTables.clear();
             knownColumns.clear();
             vectorIndexPresent.clear();
+            fieldDistance.clear();
         }
     }
 
@@ -497,6 +656,11 @@ public class YdbIndexProvider implements IndexProvider {
         executeDdl("DROP TABLE IF EXISTS `" + tablePath(storeName) + "`;");
         ensuredTables.remove(storeName);
         knownColumns.remove(storeName);
+        // drop cached per-column state for this store so a rebuilt store is re-probed, not
+        // served from a stale "index present" entry that would make kNN silently return empty
+        String prefix = storeName + "/";
+        vectorIndexPresent.keySet().removeIf(key -> key.startsWith(prefix));
+        fieldDistance.keySet().removeIf(key -> key.startsWith(prefix));
     }
 
     @Override
@@ -519,7 +683,8 @@ public class YdbIndexProvider implements IndexProvider {
     // -------------------------------------------------------- vector index ops
 
     /**
-     * Builds (or rebuilds) the {@code vector_kmeans_tree} index for a vector field:
+     * Builds (or rebuilds) the {@code vector_kmeans_tree} index for a vector field with the
+     * default distance strategy (or the per-key {@code distance} recorded at register time):
      * a new index is built online under a temporary name and atomically swapped in.
      * Until this has been called at least once, kNN queries use exact scans.
      * Recommended after initial data load and periodically when the data
@@ -527,12 +692,26 @@ public class YdbIndexProvider implements IndexProvider {
      */
     public void buildVectorIndex(String store, String field) throws BackendException {
         String column = columnName(field);
+        buildVectorIndex(store, field, fieldDistance.getOrDefault(store + "/" + column, defaultDistance));
+    }
+
+    /**
+     * Builds the vector index with an explicit distance strategy. The metric MUST match the
+     * one used by kNN queries for this field; a mismatch is a hard INTERNAL_ERROR in YDB.
+     */
+    public void buildVectorIndex(String store, String field, Distance distance) throws BackendException {
+        String column = columnName(field);
         int dimension = defaultDimension > 0 ? defaultDimension : probeDimension(store, column);
         String indexName = INDEX_PREFIX + column;
         String tmpName = indexName + TMP_INDEX_SUFFIX;
+        // drop any leftover temp index from an interrupted earlier build so this is re-runnable
+        // (YDB's ADD INDEX cannot overwrite an existing index, and has no DROP INDEX IF EXISTS)
+        if (tableIndexExists(store, tmpName)) {
+            executeDdl("ALTER TABLE `" + tablePath(store) + "` DROP INDEX " + tmpName + ";");
+        }
         executeDdl("ALTER TABLE `" + tablePath(store) + "` ADD INDEX " + tmpName
             + " GLOBAL USING vector_kmeans_tree ON (" + column + ") COVER (" + column + ")"
-            + " WITH (" + defaultDistance.withClause + ", vector_type=\"float\", vector_dimension=" + dimension
+            + " WITH (" + distance.withClause + ", vector_type=\"float\", vector_dimension=" + dimension
             + ", levels=" + indexLevels + ", clusters=" + indexClusters + ");");
         try {
             Status status = tableRetryCtx.supplyStatus(session -> session.alterTable(tablePath(store),
@@ -543,8 +722,9 @@ public class YdbIndexProvider implements IndexProvider {
         } catch (RuntimeException e) {
             throw YdbExceptions.fromThrowable(e, "swap vector index");
         }
-        vectorIndexPresent.put(store + "/" + column, Boolean.TRUE);
-        log.info("Built vector index {} on {} (dimension {})", indexName, tablePath(store), dimension);
+        vectorIndexPresent.put(store + "/" + column, new IndexProbe(true, System.nanoTime()));
+        log.info("Built vector index {} on {} with {} (dimension {})",
+            indexName, tablePath(store), distance.withClause, dimension);
     }
 
     private int probeDimension(String store, String column) throws BackendException {
@@ -560,18 +740,47 @@ public class YdbIndexProvider implements IndexProvider {
             + ": no vectors stored yet and no configured vector-dimension");
     }
 
+    /**
+     * Whether a vector index exists for the field. A positive result is cached permanently
+     * (an index only disappears via clearStore/clearStorage, which invalidate the entry); a
+     * negative result is re-probed after {@link #NEGATIVE_CACHE_TTL_NANOS} so an index built
+     * elsewhere is eventually adopted; a probe error is never cached (so it never pins the
+     * field to the O(n) exact-scan fallback until a JVM restart).
+     */
     private boolean vectorIndexExists(String store, String column) {
-        return vectorIndexPresent.computeIfAbsent(store + "/" + column, cacheKey -> {
-            try {
-                Result<TableDescription> description = tableRetryCtx
-                    .supplyResult(session -> session.describeTable(tablePath(store))).join();
-                return description.isSuccess() && description.getValue().getIndexes().stream()
-                    .map(TableIndex::getName)
-                    .anyMatch(name -> name.equals(INDEX_PREFIX + column));
-            } catch (RuntimeException e) {
-                return Boolean.FALSE;
+        String cacheKey = store + "/" + column;
+        IndexProbe cached = vectorIndexPresent.get(cacheKey);
+        if (cached != null && (cached.present || System.nanoTime() - cached.checkedAtNanos < negativeCacheTtlNanos)) {
+            return cached.present;
+        }
+        Boolean present = describeIndexPresence(store, INDEX_PREFIX + column);
+        if (present == null) {
+            return false; // transient/scheme error — do not cache, re-probe next time
+        }
+        vectorIndexPresent.put(cacheKey, new IndexProbe(present, System.nanoTime()));
+        return present;
+    }
+
+    /** Whether {@code indexName} exists on the store table; false if the probe fails (not cached). */
+    private boolean tableIndexExists(String store, String indexName) {
+        return Boolean.TRUE.equals(describeIndexPresence(store, indexName));
+    }
+
+    /** Returns TRUE/FALSE if the index presence could be determined, or null on a probe error. */
+    private Boolean describeIndexPresence(String store, String indexName) {
+        try {
+            Result<TableDescription> description = tableRetryCtx
+                .supplyResult(session -> session.describeTable(tablePath(store))).join();
+            if (!description.isSuccess()) {
+                return null;
             }
-        });
+            return description.getValue().getIndexes().stream()
+                .map(TableIndex::getName)
+                .anyMatch(name -> name.equals(indexName));
+        } catch (RuntimeException e) {
+            log.debug("Index probe failed for {}.{}, treating as absent this time", store, indexName, e);
+            return null;
+        }
     }
 
     // ---------------------------------------------------------------- helpers
@@ -701,37 +910,6 @@ public class YdbIndexProvider implements IndexProvider {
         } else {
             throw new IllegalArgumentException("Condition not supported: " + condition);
         }
-    }
-
-    private int appendDelete(StringBuilder statements, StringBuilder declares, Params params, int p,
-                             String store, String docId) {
-        String param = "$d" + p;
-        declares.append("DECLARE ").append(param).append(" AS Utf8;\n");
-        statements.append("DELETE FROM `").append(tablePath(store)).append("` WHERE ")
-            .append(DOC_ID).append(" = ").append(param).append(";\n");
-        params.put(param, PrimitiveValue.newText(docId));
-        return p + 1;
-    }
-
-    private int appendUpsert(StringBuilder statements, StringBuilder declares, Params params, int p,
-                             String store, String docId, Map<String, Value<?>> columns) {
-        String idParam = "$i" + p;
-        declares.append("DECLARE ").append(idParam).append(" AS Utf8;\n");
-        params.put(idParam, PrimitiveValue.newText(docId));
-        StringBuilder cols = new StringBuilder(DOC_ID);
-        StringBuilder values = new StringBuilder(idParam);
-        int v = 0;
-        for (Map.Entry<String, Value<?>> column : columns.entrySet()) {
-            String param = "$v" + p + "_" + v++;
-            declares.append("DECLARE ").append(param).append(" AS ")
-                .append(column.getValue().getType()).append(";\n");
-            params.put(param, column.getValue());
-            cols.append(", ").append(column.getKey());
-            values.append(", ").append(param);
-        }
-        statements.append("UPSERT INTO `").append(tablePath(store)).append("` (").append(cols)
-            .append(") VALUES (").append(values).append(");\n");
-        return p + 1;
     }
 
     private KeyInformation keyInfo(KeyInformation.StoreRetriever infos, String field) {

@@ -71,6 +71,7 @@ import tech.ydb.table.values.ListValue;
 import tech.ydb.table.values.PrimitiveType;
 import tech.ydb.table.values.PrimitiveValue;
 import tech.ydb.table.values.StructType;
+import tech.ydb.table.values.Value;
 
 import static org.janusgraph.diskstorage.ydb.YdbConfigOptions.AUTH_MODE;
 import static org.janusgraph.diskstorage.ydb.YdbConfigOptions.AUTH_PASSWORD;
@@ -106,6 +107,8 @@ public class YdbStoreManager extends AbstractStoreManager implements OrderedKeyV
 
     /** Row cap of one statement batch inside a commit or bulk load. */
     private static final int WRITE_CHUNK_ROWS = 50_000;
+    /** Byte cap of one statement batch: keeps a chunk's parameters under YDB's 50 MB limit. */
+    private static final long WRITE_CHUNK_BYTES = 16L * 1024 * 1024;
 
     private final Map<String, YdbKeyValueStore> stores = new ConcurrentHashMap<>();
 
@@ -370,63 +373,88 @@ public class YdbStoreManager extends AbstractStoreManager implements OrderedKeyV
         }
     }
 
+    /**
+     * Splits buffered writes into chunks bounded by BOTH row count and serialized byte size.
+     * The byte bound matters because a single value may be up to 16 MB while one query's total
+     * parameters must stay under 50 MB — a purely row-count split would let large-value
+     * transactions exceed that limit and never commit.
+     */
     private List<WriteChunk> buildChunks(Map<String, YdbTx.StoreBuffer> buffers) {
-        List<WriteChunk> chunks = new ArrayList<>();
-        StringBuilder declares = new StringBuilder();
-        StringBuilder statements = new StringBuilder();
-        Params params = Params.create();
-        int paramIndex = 0;
-        int rows = 0;
-
+        ChunkAccumulator acc = new ChunkAccumulator();
         for (Map.Entry<String, YdbTx.StoreBuffer> entry : buffers.entrySet()) {
             String table = "`" + entry.getKey() + "`";
             YdbTx.StoreBuffer buffer = entry.getValue();
 
-            for (List<byte[]> part : Lists.partition(new ArrayList<>(buffer.deletions), WRITE_CHUNK_ROWS)) {
-                if (rows > 0 && rows + part.size() > WRITE_CHUNK_ROWS) {
-                    chunks.add(new WriteChunk(declares.append(statements).toString(), params));
-                    declares = new StringBuilder();
-                    statements = new StringBuilder();
-                    params = Params.create();
-                    rows = 0;
+            List<byte[]> deletions = new ArrayList<>(buffer.deletions);
+            for (int i = 0; i < deletions.size(); ) {
+                List<Value<?>> rows = new ArrayList<>();
+                long bytes = 0;
+                while (i < deletions.size() && rows.size() < WRITE_CHUNK_ROWS && bytes < WRITE_CHUNK_BYTES) {
+                    byte[] key = deletions.get(i++);
+                    rows.add(DELETE_ROW_TYPE.newValue("key", PrimitiveValue.newBytes(key)));
+                    bytes += key.length + 16L;
                 }
-                String param = "$del" + paramIndex++;
-                declares.append("DECLARE ").append(param).append(" AS ")
-                    .append(ListType.of(DELETE_ROW_TYPE)).append(";\n");
-                statements.append("DELETE FROM ").append(table)
-                    .append(" ON SELECT * FROM AS_TABLE(").append(param).append(");\n");
-                params.put(param, ListType.of(DELETE_ROW_TYPE).newValue(part.stream()
-                    .map(key -> DELETE_ROW_TYPE.newValue("key", PrimitiveValue.newBytes(key)))
-                    .collect(Collectors.toList())));
-                rows += part.size();
+                acc.add("DELETE FROM " + table + " ON SELECT * FROM AS_TABLE(", DELETE_ROW_TYPE, rows, bytes);
             }
 
             List<Map.Entry<byte[], byte[]>> additions = new ArrayList<>(buffer.additions.entrySet());
-            for (List<Map.Entry<byte[], byte[]>> part : Lists.partition(additions, WRITE_CHUNK_ROWS)) {
-                if (rows > 0 && rows + part.size() > WRITE_CHUNK_ROWS) {
-                    chunks.add(new WriteChunk(declares.append(statements).toString(), params));
-                    declares = new StringBuilder();
-                    statements = new StringBuilder();
-                    params = Params.create();
-                    rows = 0;
-                }
-                String param = "$add" + paramIndex++;
-                declares.append("DECLARE ").append(param).append(" AS ")
-                    .append(ListType.of(UPSERT_ROW_TYPE)).append(";\n");
-                statements.append("UPSERT INTO ").append(table)
-                    .append(" SELECT * FROM AS_TABLE(").append(param).append(");\n");
-                params.put(param, ListType.of(UPSERT_ROW_TYPE).newValue(part.stream()
-                    .map(e -> UPSERT_ROW_TYPE.newValue(
+            for (int i = 0; i < additions.size(); ) {
+                List<Value<?>> rows = new ArrayList<>();
+                long bytes = 0;
+                while (i < additions.size() && rows.size() < WRITE_CHUNK_ROWS && bytes < WRITE_CHUNK_BYTES) {
+                    Map.Entry<byte[], byte[]> e = additions.get(i++);
+                    rows.add(UPSERT_ROW_TYPE.newValue(
                         "key", PrimitiveValue.newBytes(e.getKey()),
-                        "value", PrimitiveValue.newBytes(e.getValue())))
-                    .collect(Collectors.toList())));
-                rows += part.size();
+                        "value", PrimitiveValue.newBytes(e.getValue())));
+                    bytes += e.getKey().length + e.getValue().length + 16L;
+                }
+                acc.add("UPSERT INTO " + table + " SELECT * FROM AS_TABLE(", UPSERT_ROW_TYPE, rows, bytes);
             }
         }
-        if (statements.length() > 0) {
-            chunks.add(new WriteChunk(declares.append(statements).toString(), params));
+        return acc.finish();
+    }
+
+    /** Accumulates AS_TABLE statements into multi-statement chunks bounded by row count and bytes. */
+    private static final class ChunkAccumulator {
+        private final List<WriteChunk> chunks = new ArrayList<>();
+        private StringBuilder declares = new StringBuilder();
+        private StringBuilder statements = new StringBuilder();
+        private Params params = Params.create();
+        private int paramIndex = 0;
+        private int rows = 0;
+        private long bytes = 0;
+
+        void add(String statementPrefix, StructType rowType, List<Value<?>> rowValues, long rowBytes) {
+            if (rowValues.isEmpty()) {
+                return;
+            }
+            if (statements.length() > 0
+                    && (rows + rowValues.size() > WRITE_CHUNK_ROWS || bytes + rowBytes > WRITE_CHUNK_BYTES)) {
+                flush();
+            }
+            String param = "$p" + paramIndex++;
+            declares.append("DECLARE ").append(param).append(" AS ").append(ListType.of(rowType)).append(";\n");
+            statements.append(statementPrefix).append(param).append(");\n");
+            params.put(param, ListType.of(rowType).newValue(rowValues));
+            rows += rowValues.size();
+            bytes += rowBytes;
         }
-        return chunks;
+
+        private void flush() {
+            chunks.add(new WriteChunk(declares.append(statements).toString(), params));
+            declares = new StringBuilder();
+            statements = new StringBuilder();
+            params = Params.create();
+            rows = 0;
+            bytes = 0;
+        }
+
+        List<WriteChunk> finish() {
+            if (statements.length() > 0) {
+                flush();
+            }
+            return chunks;
+        }
     }
 
     /**
@@ -526,7 +554,8 @@ public class YdbStoreManager extends AbstractStoreManager implements OrderedKeyV
             }
             for (tech.ydb.scheme.description.Entry child : listing.getValue().getEntryChildren()) {
                 if (child.getType() == EntryType.TABLE) {
-                    executeDdl("DROP TABLE `" + rootPath + "/" + child.getName() + "`;",
+                    // IF EXISTS so a retried drop (idempotent retry after a lost response) is a no-op
+                    executeDdl("DROP TABLE IF EXISTS `" + rootPath + "/" + child.getName() + "`;",
                         "drop table " + child.getName());
                 }
             }

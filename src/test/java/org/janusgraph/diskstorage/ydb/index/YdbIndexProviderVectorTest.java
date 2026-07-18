@@ -235,4 +235,162 @@ public class YdbIndexProviderVectorTest {
         assertEquals(0, index.query(new IndexQuery(STORE,
             PredicateCondition.of(WEIGHT, Cmp.EQUAL, 1.0)), retriever, tx).count());
     }
+
+    /**
+     * Regression for finding #1: one mutate() call carrying hundreds of documents must not
+     * exceed YDB's 10 KB query-text limit. The per-column AS_TABLE batching keeps the query
+     * text constant-size regardless of document count, whereas the old per-document statements
+     * blew the limit at ~70 documents.
+     */
+    @Test
+    public void manyDocumentsInOneMutateCall() throws BackendException {
+        int n = 500;
+        Map<String, IndexMutation> docs = new HashMap<>();
+        for (int i = 0; i < n; i++) {
+            docs.put("doc" + i, new IndexMutation(keys::get,
+                ImmutableList.of(new IndexEntry(NAME, "name" + i), new IndexEntry(WEIGHT, (double) i)),
+                ImmutableList.of(), true, false));
+        }
+        Map<String, Map<String, IndexMutation>> mutations = new HashMap<>();
+        mutations.put(STORE, docs);
+        index.mutate(mutations, retriever, tx);
+
+        // every document is present and individually addressable
+        assertEquals(ImmutableList.of("doc123"), index.query(new IndexQuery(STORE,
+            PredicateCondition.of(NAME, Cmp.EQUAL, "name123")), retriever, tx).collect(Collectors.toList()));
+        assertEquals(n, index.query(new IndexQuery(STORE,
+            PredicateCondition.of(WEIGHT, Cmp.GREATER_THAN_EQUAL, 0.0)), retriever, tx).count());
+    }
+
+    /**
+     * Regression for finding #2: buildVectorIndex must use the field's per-key distance, not the
+     * backend default. A cosine-built index queried with euclidean is a hard INTERNAL_ERROR.
+     */
+    @Test
+    public void perKeyDistanceIsHonoredByBuild() throws BackendException {
+        String dir = "janusgraph-index-euclid-test";
+        YdbIndexProvider euclid = new YdbIndexProvider(providerConfig(dir, 30000));
+        euclid.clearStorage();
+        Map<String, KeyInformation> ekeys = new HashMap<>();
+        ekeys.put(EMBEDDING, new StandardKeyInformation(float[].class, Cardinality.SINGLE,
+            Parameter.of(ParameterType.customParameterName("dimension"), 4),
+            Parameter.of(ParameterType.customParameterName("distance"), "euclidean")));
+        KeyInformation.IndexRetriever er = retriever(ekeys);
+        BaseTransaction etx = euclid.beginTransaction(StandardBaseTransactionConfig.of(TimestampProviders.MILLI));
+        try {
+            euclid.register(STORE, EMBEDDING, ekeys.get(EMBEDDING), etx);
+            float[][] vectors = {{1f, 0f, 0f, 0f}, {0.9f, 0.1f, 0f, 0f}, {0f, 1f, 0f, 0f},
+                {0f, 0f, 1f, 0f}, {0.5f, 0.5f, 0f, 0f}};
+            Map<String, IndexMutation> docs = new HashMap<>();
+            for (int i = 0; i < vectors.length; i++) {
+                docs.put("doc" + i, new IndexMutation(ekeys::get,
+                    ImmutableList.of(new IndexEntry(EMBEDDING, vectors[i])), ImmutableList.of(), true, false));
+            }
+            Map<String, Map<String, IndexMutation>> m = new HashMap<>();
+            m.put(STORE, docs);
+            euclid.mutate(m, er, etx);
+
+            // build with the per-key euclidean distance, then query — must not INTERNAL_ERROR
+            euclid.buildVectorIndex(STORE, EMBEDDING);
+            RawQuery q = new RawQuery(STORE, YdbVectors.nearest(EMBEDDING, new float[]{1f, 0.05f, 0f, 0f})
+                .replaceFirst("^v\\.", ""), new Parameter[0]).setLimit(1);
+            List<String> nearest = euclid.query(q, er, etx).map(RawQuery.Result::getResult)
+                .collect(Collectors.toList());
+            assertEquals("doc0", nearest.get(0));
+        } finally {
+            euclid.clearStorage();
+            euclid.close();
+        }
+    }
+
+    /**
+     * Regression for finding #3: clearStore must invalidate the vectorIndexPresent cache; otherwise
+     * a rebuilt store queries a VIEW of a no-longer-existing index and kNN silently returns empty.
+     */
+    @Test
+    public void clearStoreInvalidatesVectorIndexCache() throws BackendException {
+        loadDocuments();
+        index.buildVectorIndex(STORE, EMBEDDING);           // caches "index present" = TRUE
+        assertEquals(3, knn(new float[]{1f, 0.05f, 0f, 0f}, 3).size());
+
+        index.clearStore(STORE);                            // drops table + must clear the cache
+        // re-register and repopulate the store WITHOUT a vector index
+        for (Map.Entry<String, KeyInformation> key : keys.entrySet()) {
+            index.register(STORE, key.getKey(), key.getValue(), tx);
+        }
+        loadDocuments();
+
+        // kNN must fall back to exact scan and return results, not a stale-VIEW empty set
+        assertEquals(ImmutableList.of("doc0", "doc1", "doc4"), knn(new float[]{1f, 0.05f, 0f, 0f}, 3));
+    }
+
+    /**
+     * Regression for finding #6: buildVectorIndex must be re-runnable even if a previous build left
+     * a temporary index behind. The DROP-tmp-before-ADD makes rebuilds idempotent.
+     */
+    @Test
+    public void buildVectorIndexIsRerunnable() throws BackendException {
+        loadDocuments();
+        index.buildVectorIndex(STORE, EMBEDDING);
+        // a second build (the periodic-rebuild path) must not fail with "tmp index exists"
+        index.buildVectorIndex(STORE, EMBEDDING);
+        assertEquals(ImmutableList.of("doc0", "doc1", "doc4"), knn(new float[]{1f, 0.05f, 0f, 0f}, 3));
+    }
+
+    /**
+     * Regression for finding #7: a separate provider instance that probed "no index" before the
+     * index was built must adopt it after the negative-cache window elapses (here 0 ms = every
+     * query), instead of being pinned to the exact-scan fallback forever.
+     */
+    @Test
+    public void negativeIndexCacheIsReprobed() throws BackendException {
+        String dir = "janusgraph-index-reprobe-test";
+        YdbIndexProvider serving = new YdbIndexProvider(providerConfig(dir, 0));   // re-probe every query
+        YdbIndexProvider admin = new YdbIndexProvider(providerConfig(dir, 30000));
+        serving.clearStorage();
+        BaseTransaction stx = serving.beginTransaction(StandardBaseTransactionConfig.of(TimestampProviders.MILLI));
+        BaseTransaction atx = admin.beginTransaction(StandardBaseTransactionConfig.of(TimestampProviders.MILLI));
+        try {
+            for (YdbIndexProvider p : new YdbIndexProvider[]{serving, admin}) {
+                BaseTransaction t = p == serving ? stx : atx;
+                p.register(STORE, EMBEDDING, keys.get(EMBEDDING), t);
+            }
+            float[][] vectors = {{1f, 0f, 0f, 0f}, {0.9f, 0.1f, 0f, 0f}, {0f, 1f, 0f, 0f},
+                {0f, 0f, 1f, 0f}, {0.5f, 0.5f, 0f, 0f}};
+            Map<String, IndexMutation> docs = new HashMap<>();
+            for (int i = 0; i < vectors.length; i++) {
+                docs.put("doc" + i, new IndexMutation(keys::get,
+                    ImmutableList.of(new IndexEntry(EMBEDDING, vectors[i])), ImmutableList.of(), true, false));
+            }
+            Map<String, Map<String, IndexMutation>> m = new HashMap<>();
+            m.put(STORE, docs);
+            serving.mutate(m, retriever, stx);
+
+            // serving probes "no index yet" (exact scan) — under the bug this FALSE would be pinned
+            RawQuery q = new RawQuery(STORE, YdbVectors.nearest(EMBEDDING, new float[]{1f, 0.05f, 0f, 0f})
+                .replaceFirst("^v\\.", ""), new Parameter[0]).setLimit(3);
+            assertEquals(3, serving.query(q, retriever, stx).count());
+
+            // admin instance builds the index
+            admin.buildVectorIndex(STORE, EMBEDDING);
+
+            // serving re-probes (ttl 0) and now serves via the index — still correct results
+            assertEquals(3, serving.query(q, retriever, stx).count());
+        } finally {
+            serving.clearStorage();
+            serving.close();
+            admin.close();
+        }
+    }
+
+    private static Configuration providerConfig(String directory, int recheckMs) {
+        ModifiableConfiguration config = GraphDatabaseConfiguration.buildGraphConfiguration();
+        config.set(YdbIndexConfigOptions.ENDPOINT, YdbTestEnv.endpoint(), INDEX_NAME);
+        config.set(YdbIndexConfigOptions.DATABASE, YdbTestEnv.database(), INDEX_NAME);
+        config.set(YdbIndexConfigOptions.DIRECTORY, directory, INDEX_NAME);
+        config.set(YdbIndexConfigOptions.VECTOR_INDEX_LEVELS, 1, INDEX_NAME);
+        config.set(YdbIndexConfigOptions.VECTOR_INDEX_CLUSTERS, 2, INDEX_NAME);
+        config.set(YdbIndexConfigOptions.VECTOR_INDEX_RECHECK_MS, recheckMs, INDEX_NAME);
+        return config.restrictTo(INDEX_NAME);
+    }
 }

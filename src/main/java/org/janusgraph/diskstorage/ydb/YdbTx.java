@@ -27,7 +27,6 @@ import com.google.common.primitives.UnsignedBytes;
 import org.janusgraph.diskstorage.BackendException;
 import org.janusgraph.diskstorage.BaseTransactionConfig;
 import org.janusgraph.diskstorage.PermanentBackendException;
-import org.janusgraph.diskstorage.TemporaryBackendException;
 import org.janusgraph.diskstorage.common.AbstractStoreTransaction;
 import org.janusgraph.diskstorage.keycolumnvalue.StoreTransaction;
 import org.slf4j.Logger;
@@ -198,7 +197,11 @@ public class YdbTx extends AbstractStoreTransaction {
             Result<QueryReader> result = QueryReader.readFrom(tx.createQuery(yql, params)).join();
             if (!result.isSuccess()) {
                 invalidate();
-                throw YdbExceptions.fromStatus(result.getStatus(), "query");
+                // Any failed statement kills the server-side transaction, so retrying this
+                // operation against it is futile; fail permanently so BackendOperation stops
+                // retrying and the whole JanusGraph transaction is retried instead.
+                throw new PermanentBackendException(
+                    "YDB interactive transaction failed and cannot be retried: " + result.getStatus());
             }
             if (isWrite) {
                 hasWrites = true;
@@ -206,7 +209,8 @@ public class YdbTx extends AbstractStoreTransaction {
             return result.getValue();
         } catch (RuntimeException e) {
             invalidate();
-            throw YdbExceptions.fromThrowable(e, "query");
+            throw new PermanentBackendException(
+                "YDB interactive transaction failed and cannot be retried", e);
         }
     }
 
@@ -256,7 +260,7 @@ public class YdbTx extends AbstractStoreTransaction {
     private void commitInteractive() throws BackendException {
         if (broken) {
             closed = true;
-            throw new TemporaryBackendException(
+            throw new PermanentBackendException(
                 "YDB transaction was invalidated by a previous failure and cannot be committed");
         }
         try {
@@ -289,7 +293,9 @@ public class YdbTx extends AbstractStoreTransaction {
     private void ensureActive() throws BackendException {
         checkOpen();
         if (broken) {
-            throw new TemporaryBackendException(
+            // the server-side transaction is permanently gone; do not let BackendOperation
+            // retry against it (that would spin uselessly for the whole write-time budget)
+            throw new PermanentBackendException(
                 "YDB transaction was invalidated by a previous failure; retry the enclosing transaction");
         }
         if (tx == null) {

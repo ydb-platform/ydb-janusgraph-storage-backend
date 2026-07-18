@@ -85,6 +85,17 @@ public interface YdbIndexConfigOptions {
         ConfigOption.Type.LOCAL,
         true);
 
+    ConfigOption<Integer> VECTOR_INDEX_RECHECK_MS = new ConfigOption<>(
+        YDB_INDEX_NS,
+        "vector-index-recheck-ms",
+        "How long (milliseconds) a negative 'no vector index yet' probe is cached before the " +
+            "server is re-checked. Keeps kNN from issuing a describeTable per query while an index " +
+            "has not been built, yet lets an index built elsewhere be adopted within this window. " +
+            "0 re-probes every query.",
+        ConfigOption.Type.LOCAL,
+        30000,
+        ConfigOption.nonnegativeInt());
+
     ConfigOption<Integer> SEARCH_TOP_SIZE = new ConfigOption<>(
         YDB_INDEX_NS,
         "search-top-size",

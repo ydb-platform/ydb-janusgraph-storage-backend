@@ -136,4 +136,16 @@ public interface YdbConfigOptions {
         "Enable automatic partitioning by size and by load for the created store tables.",
         ConfigOption.Type.LOCAL,
         true);
+
+    ConfigOption<Integer> PRESPLIT_PARTITIONS = new ConfigOption<>(
+        YDB_NS,
+        "presplit-partitions",
+        "Pre-split every newly created store table into this many shards at uniform key " +
+            "boundaries and keep at least that many shards (AUTO_PARTITIONING_MIN_PARTITIONS_COUNT). " +
+            "Uniform boundaries align with JanusGraph's virtual partitions (cluster.max-partitions), " +
+            "whose id occupies the top bits of edgestore keys, so ingestion is spread across shards " +
+            "from the very first write instead of waiting for organic splits. 0 disables, max 256.",
+        ConfigOption.Type.LOCAL,
+        0,
+        ConfigOption.nonnegativeInt());
 }

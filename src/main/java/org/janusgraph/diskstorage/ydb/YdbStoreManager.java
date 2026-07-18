@@ -80,6 +80,7 @@ import static org.janusgraph.diskstorage.ydb.YdbConfigOptions.AUTO_PARTITIONING;
 import static org.janusgraph.diskstorage.ydb.YdbConfigOptions.DATABASE;
 import static org.janusgraph.diskstorage.ydb.YdbConfigOptions.DIRECTORY;
 import static org.janusgraph.diskstorage.ydb.YdbConfigOptions.ENDPOINT;
+import static org.janusgraph.diskstorage.ydb.YdbConfigOptions.PRESPLIT_PARTITIONS;
 import static org.janusgraph.diskstorage.ydb.YdbConfigOptions.READ_TX_MODE;
 import static org.janusgraph.diskstorage.ydb.YdbConfigOptions.SCAN_PAGE_SIZE;
 import static org.janusgraph.diskstorage.ydb.YdbConfigOptions.SESSION_ACQUIRE_TIMEOUT;
@@ -124,6 +125,7 @@ public class YdbStoreManager extends AbstractStoreManager implements OrderedKeyV
     private final int scanPageSize;
     private final int sliceBatchSize;
     private final boolean autoPartitioning;
+    private final int presplitPartitions;
 
     public YdbStoreManager(Configuration configuration) throws BackendException {
         super(configuration);
@@ -134,6 +136,10 @@ public class YdbStoreManager extends AbstractStoreManager implements OrderedKeyV
         this.scanPageSize = configuration.get(SCAN_PAGE_SIZE);
         this.sliceBatchSize = configuration.get(SLICE_BATCH_SIZE);
         this.autoPartitioning = configuration.get(AUTO_PARTITIONING);
+        this.presplitPartitions = configuration.get(PRESPLIT_PARTITIONS);
+        if (presplitPartitions > 256) {
+            throw new PermanentBackendException("storage.ydb.presplit-partitions must be at most 256");
+        }
 
         String endpoint = configuration.get(ENDPOINT);
         GrpcTransport newTransport;
@@ -592,13 +598,32 @@ public class YdbStoreManager extends AbstractStoreManager implements OrderedKeyV
     }
 
     private void createTableIfNotExists(String storeName) throws BackendException {
+        List<String> with = new ArrayList<>();
+        if (autoPartitioning) {
+            with.add("AUTO_PARTITIONING_BY_SIZE = ENABLED");
+            with.add("AUTO_PARTITIONING_BY_LOAD = ENABLED");
+        }
+        if (presplitPartitions > 1) {
+            with.add("AUTO_PARTITIONING_MIN_PARTITIONS_COUNT = " + presplitPartitions);
+            with.add("PARTITION_AT_KEYS = (" + presplitBoundaries(presplitPartitions) + ")");
+        }
         String ddl = "CREATE TABLE IF NOT EXISTS `" + tablePath(storeName) + "` ("
             + "key String NOT NULL, value String, PRIMARY KEY (key))"
-            + (autoPartitioning
-                ? " WITH (AUTO_PARTITIONING_BY_SIZE = ENABLED, AUTO_PARTITIONING_BY_LOAD = ENABLED)"
-                : "")
+            + (with.isEmpty() ? "" : " WITH (" + String.join(", ", with) + ")")
             + ";";
         executeDdl(ddl, "create table for store '" + storeName + "'");
+    }
+
+    /** N-1 uniform single-byte boundaries over the key space, as YQL string literals. */
+    private static String presplitBoundaries(int partitions) {
+        StringBuilder boundaries = new StringBuilder();
+        for (int i = 1; i < partitions; i++) {
+            if (boundaries.length() > 0) {
+                boundaries.append(", ");
+            }
+            boundaries.append(String.format("'\\x%02x'", (int) (i * 256L / partitions)));
+        }
+        return boundaries.toString();
     }
 
     private void executeDdl(String ddl, String operation) throws BackendException {

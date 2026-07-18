@@ -73,6 +73,7 @@ GraphTraversalSource g = graph.traversal();
 | `storage.ydb.scan-page-size` | `10000` | Max rows per round trip during range scans |
 | `storage.ydb.slice-batch-size` | `10` | Max ranges combined into one multi-statement query by batched slice reads |
 | `storage.ydb.auto-partitioning` | `true` | Enable auto-partitioning by size and load for store tables |
+| `storage.ydb.presplit-partitions` | `0` | Pre-split new store tables into N shards at uniform key boundaries (aligned with JanusGraph's virtual partitions); avoids the single-hot-shard warm-up phase under ingest |
 
 ## Data model
 

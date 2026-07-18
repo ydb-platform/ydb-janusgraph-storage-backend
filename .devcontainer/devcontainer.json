@@ -8,6 +8,11 @@
     "features": {
         "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
     },
+    "forwardPorts": [8765, 2136],
+    "portsAttributes": {
+        "8765": {"label": "YDB Web UI"},
+        "2136": {"label": "YDB gRPC"}
+    },
     "customizations": {
         "vscode": {
             "extensions": [

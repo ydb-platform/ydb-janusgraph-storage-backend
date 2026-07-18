@@ -6,6 +6,9 @@ services:
     init: true
     command: sleep infinity
     working_dir: /workspace
+    # Share the YDB service's network namespace: no host ports are published
+    # anywhere, so any number of devcontainer instances can run concurrently.
+    network_mode: service:ydb
     volumes:
       - ..:/workspace:cached
       - m2-cache:/root/.m2
@@ -22,7 +25,8 @@ services:
         condition: service_healthy
 
   ydb:
-    image: ydbplatform/local-ydb:latest
+    # latest = current stable; use YDB_IMAGE=ydbplatform/local-ydb:nightly for the newest build
+    image: ${YDB_IMAGE:-ydbplatform/local-ydb:latest}
     # local-ydb images are amd64-only; on Apple Silicon this runs via Rosetta.
     platform: linux/amd64
     hostname: ydb
@@ -32,9 +36,6 @@ services:
       GRPC_PORT: "2136"
       GRPC_TLS_PORT: "2135"
       MON_PORT: "8765"
-    ports:
-      - "127.0.0.1:2136:2136"   # gRPC, for host-side ydb CLI poking
-      - "127.0.0.1:8765:8765"   # embedded web UI
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'exec 6<>/dev/tcp/localhost/2136'"]
       interval: 5s
